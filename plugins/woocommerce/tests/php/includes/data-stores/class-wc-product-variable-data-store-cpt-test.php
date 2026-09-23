@@ -486,6 +486,10 @@ class WC_Product_Variable_Data_Store_CPT_Test extends WC_Unit_Test_Case {
 
 		$this->assertEquals( $prices_with_tax, array_values( $variation_prices['price'] ) );
 
+		// Verify that the stored raw prices are not tax-adjusted.
+		$first_child = wc_get_product( $product->get_children()[0] );
+		$this->assertSame( '10.00', wc_format_decimal( $first_child->get_price(), 2 ), 'Stored price must not include tax.' );
+
 		// Clean up.
 		WC_Tax::_delete_tax_rate( $tax_id );
 
@@ -715,9 +719,11 @@ class WC_Product_Variable_Data_Store_CPT_Test extends WC_Unit_Test_Case {
 
 		delete_transient( $transient_name );
 		$data_store->read_price_data( $product, $for_display );
-		$expected_hashes = array( $extended_data_store->get_price_hash( $product, $for_display ) );
-		$actual_hashes   = array_unique( $this->get_keys_for_json_encoded_transient( $transient_name ) );
-		$this->assertEquals( $expected_hashes, $actual_hashes );
+
+		// When taxes influence price, only the display hash is cached — raw hash is nulled by taxes_influence_price().
+		$actual_hashes = array_unique( $this->get_keys_for_json_encoded_transient( $transient_name ) );
+		$this->assertContains( $extended_data_store->get_price_hash( $product, true ), $actual_hashes );
+		$this->assertNotContains( $extended_data_store->get_price_hash( $product, false ), $actual_hashes );
 
 		remove_filter( 'wc_tax_enabled', '__return_true' );
 		remove_filter( 'woocommerce_product_is_taxable', '__return_true' );
@@ -2258,5 +2264,55 @@ class WC_Product_Variable_Data_Store_CPT_Test extends WC_Unit_Test_Case {
 		remove_filter( 'woocommerce_use_legacy_get_variations_price_hash', $capture_filter );
 
 		$product->delete();
+	}
+
+	/**
+	 * @testdox read_price_data does not trigger a second aggregation pass for the raw variant after the display variant is primed.
+	 */
+	public function test_read_price_data_no_double_aggregation(): void {
+		add_filter( 'wc_tax_enabled', '__return_true' );
+		add_filter( 'woocommerce_product_is_taxable', '__return_true' );
+		add_filter( 'woocommerce_matched_rates', array( $this, '__return_rates' ) );
+
+		$product        = $this->get_variation_product_fixture();
+		$data_store     = new WC_Product_Variable_Data_Store_CPT();
+		$transient_name = 'wc_var_prices_' . $product->get_id();
+
+		delete_transient( $transient_name );
+
+		$display_prices = $data_store->read_price_data( $product, true );
+		$raw_prices     = $data_store->read_price_data( $product, false );
+
+		$this->assertCount( 1, $this->get_keys_for_json_encoded_transient( $transient_name ), 'Only one hash must be stored — the second call must not trigger a separate aggregation.' );
+		$this->assertCount( count( $product->get_visible_children() ), $display_prices['price'], 'Display prices must include all visible variations.' );
+		$this->assertSame( $display_prices, $raw_prices, 'Raw prices must be served from the display cache when taxes influence price.' );
+
+		remove_filter( 'wc_tax_enabled', '__return_true' );
+		remove_filter( 'woocommerce_product_is_taxable', '__return_true' );
+		remove_filter( 'woocommerce_matched_rates', array( $this, '__return_rates' ) );
+	}
+
+	/**
+	 * @testdox read_price_data excludes variations with empty prices from the result.
+	 */
+	public function test_read_price_data_excludes_empty_price_variations(): void {
+		$product   = WC_Helper_Product::create_variation_product();
+		$child_ids = $product->get_children();
+
+		// Clear the price on the first variation.
+		$empty_variation = wc_get_product( $child_ids[0] );
+		$empty_variation->set_price( '' );
+		$empty_variation->set_regular_price( '' );
+		$empty_variation->save();
+
+		delete_transient( 'wc_var_prices_' . $product->get_id() );
+		$prices = ( new WC_Product_Variable_Data_Store_CPT() )->read_price_data( $product, false );
+
+		$this->assertCount( count( $child_ids ) - 1, $prices['price'], 'Only priced variations must be in the result.' );
+		$this->assertArrayNotHasKey( $child_ids[0], $prices['price'], 'Empty-price variation must be excluded from price array.' );
+		$this->assertArrayNotHasKey( $child_ids[0], $prices['regular_price'], 'Empty-price variation must be excluded from regular_price array.' );
+		$this->assertArrayNotHasKey( $child_ids[0], $prices['sale_price'], 'Empty-price variation must be excluded from sale_price array.' );
+
+		$product->delete( true );
 	}
 }
